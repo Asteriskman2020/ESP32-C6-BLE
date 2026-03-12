@@ -1,29 +1,27 @@
 /**
- * ESP32-C6 BLE Message Server + ADC Data Logger  v2.0
- * ──────────────────────────────────────────────────
- * NOTE: Superseded by BLE_Logger_V3 — see ../BLE_Logger_V3/
- * ──────────────────────────────────────────────────
- * Changelog v2.0 (vs v1.0)
- *   + ADC circular buffer: 200 samples on GPIO2, every 2 s
- *   + Oldest sample overwritten automatically when buffer is full
- *   + NVS persistence (flush every 10 samples, on disconnect & OTA)
- *   + BLE characteristic ab000005: latest ADC value (READ + NOTIFY)
- *   + BLE characteristic ab000006: sample count (READ)
- *   + BLE command CLRADC: clears the ADC buffer
- *   + GET /data web endpoint: JSON array oldest → newest
- *   + MQTT topic esp32c6/ble/adc: {adc, n} per sample
- * ──────────────────────────────────────────────────
+ * ESP32-C6 BLE Message Server + ADC Data Logger  v3.0
+ * ────────────────────────────────────────────────────
+ * Changelog v3.0 (vs v2.0)
+ *   ~ ADC sample interval: 2 s → 500 ms
+ *   ~ LED replaced: plain GPIO8 → WS2812 NeoPixel RGB (Adafruit NeoPixel lib)
+ *   + LED EMPTY   (0 samples)   : slow RED flash  (1 s on / 1 s off)
+ *   + LED FILLING (1-199 samples): fast BLUE flash (150 ms cycle)
+ *   + LED FULL    (200 samples)  : fast GREEN flash (300 ms cycle)
+ *   + OTA: solid WHITE during update
+ * ────────────────────────────────────────────────────
  * Features
  *   BLE     – Android reads "HELLO WORLD" from onboard memory, clears it,
  *             or resets it via a command characteristic.
- *             New: ADC latest value notified every 2 s (ab000005).
- *             New: ADC sample count readable (ab000006).
- *             New: CMD "CLRADC" clears the ADC buffer.
- *   ADC     – GPIO2 sampled every 2 s, stored in a 200-sample circular
+ *             ADC latest value notified every 500 ms (ab000005).
+ *             ADC sample count readable (ab000006).
+ *             CMD "CLRADC" clears the ADC buffer.
+ *   ADC     – GPIO2 sampled every 500 ms, stored in a 200-sample circular
  *             buffer (oldest entry overwritten when full).
  *             Buffer persisted to NVS every 10 samples.
- *   LED     – quick flash (150 ms) = message READY
- *             long  flash (1 s)   = message EMPTY
+ *   LED     – WS2812 RGB on GPIO8 (NeoPixel):
+ *               EMPTY  (0 samples)   → slow RED flash  (1 s on / 1 s off)
+ *               FILLING (1–199)      → fast BLUE flash  (150 ms cycle)
+ *               FULL   (200 samples) → fast GREEN flash (300 ms cycle)
  *   OTA     – firmware update over WiFi (arduino-cli / Arduino IDE)
  *   Web UI  – configure SSID / password / MQTT server on port 80
  *             GET /data  → JSON array of ADC samples (oldest first)
@@ -43,16 +41,29 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <Adafruit_NeoPixel.h>
 
-// ── LED pin ───────────────────────────────────────────────────────────────────
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 8
-#endif
-#define LED_PIN LED_BUILTIN
+// ── RGB LED (WS2812 NeoPixel on GPIO8) ───────────────────────────────────────
+#define NEOPIXEL_PIN   8
+#define NEOPIXEL_COUNT 1
+#define LED_BRIGHTNESS 40   // 0-255, keep low to avoid USB power issues
+
+Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// LED modes driven by ADC buffer state
+enum LedMode { LED_EMPTY, LED_FILLING, LED_FULL };
+LedMode   ledMode        = LED_EMPTY;
+bool      ledState       = false;
+unsigned long ledLastMs  = 0;
+
+// Blink periods per mode (half-cycle in ms)
+#define LED_EMPTY_HALF   1000   // slow red:   1 s on / 1 s off
+#define LED_FILLING_HALF  150   // fast blue: 150 ms on / 150 ms off
+#define LED_FULL_HALF     300   // fast green:300 ms on / 300 ms off
 
 // ── ADC / Data Logger ─────────────────────────────────────────────────────────
 #define ADC_PIN          2       // GPIO2 = ADC1_CH2 on ESP32-C6
-#define ADC_INTERVAL_MS  2000   // sample period  (2 seconds)
+#define ADC_INTERVAL_MS  500    // sample period  (500 ms)
 #define ADC_BUF_SIZE     200    // circular buffer depth
 
 // Ring buffer – indices stored as uint16_t to fit NVS cleanly
@@ -92,8 +103,6 @@ uint16_t adcSinceFlush = 0;
 #define MQTT_TOPIC    "esp32c6/ble/event"
 #define MQTT_ADC_TOPIC "esp32c6/ble/adc"
 
-#define LED_QUICK_MS  150
-#define LED_LONG_MS   1000
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 Preferences  prefs;
@@ -115,9 +124,6 @@ NimBLECharacteristic *pAdcNChar   = nullptr;  // sample count
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
 WebServer    webServer(80);
-
-unsigned long ledLastToggle = 0;
-bool          ledState      = false;
 
 // ── ADC helpers ───────────────────────────────────────────────────────────────
 
@@ -147,12 +153,20 @@ void adcClearBuffer() {
     adcCount = 0;
     adcSinceFlush = 0;
     adcFlushNVS();
+    updateLedMode();
 
     // Update BLE count characteristic
     pAdcNChar->setValue("0");
     if (bleConnected) pAdcNChar->notify();
 
     Serial.println("[ADC] Buffer cleared");
+}
+
+// Update LED mode based on current buffer state
+void updateLedMode() {
+    if      (adcCount == 0)            ledMode = LED_EMPTY;
+    else if (adcCount >= ADC_BUF_SIZE) ledMode = LED_FULL;
+    else                               ledMode = LED_FILLING;
 }
 
 // Called every ADC_INTERVAL_MS from loop()
@@ -163,6 +177,8 @@ void adcSample() {
     adcBuf[adcHead] = val;
     adcHead = (adcHead + 1) % ADC_BUF_SIZE;
     if (adcCount < ADC_BUF_SIZE) adcCount++;
+
+    updateLedMode();
 
     adcSinceFlush++;
     if (adcSinceFlush >= ADC_NVS_EVERY) {
@@ -185,16 +201,35 @@ void adcSample() {
     snprintf(msg, sizeof(msg), "{\"adc\":%u,\"n\":%u}", val, adcCount);
     if (mqtt.connected()) mqtt.publish(MQTT_ADC_TOPIC, msg);
 
-    Serial.printf("[ADC] #%u  GPIO%d → %u\n", adcCount, ADC_PIN, val);
+    Serial.printf("[ADC] #%u  GPIO%d → %u  LED=%s\n", adcCount, ADC_PIN, val,
+        ledMode == LED_EMPTY ? "RED" : ledMode == LED_FILLING ? "BLUE" : "GREEN");
 }
 
-// ── LED ───────────────────────────────────────────────────────────────────────
+// ── LED (NeoPixel RGB) ────────────────────────────────────────────────────────
 void updateLed() {
-    unsigned long interval = messagePresent ? LED_QUICK_MS : LED_LONG_MS;
-    if (millis() - ledLastToggle >= interval) {
-        ledLastToggle = millis();
-        ledState = !ledState;
-        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    unsigned long halfCycle;
+    uint32_t colour;
+
+    switch (ledMode) {
+        case LED_EMPTY:
+            halfCycle = LED_EMPTY_HALF;
+            colour    = strip.Color(LED_BRIGHTNESS, 0, 0);   // RED
+            break;
+        case LED_FILLING:
+            halfCycle = LED_FILLING_HALF;
+            colour    = strip.Color(0, 0, LED_BRIGHTNESS);   // BLUE
+            break;
+        default: // LED_FULL
+            halfCycle = LED_FULL_HALF;
+            colour    = strip.Color(0, LED_BRIGHTNESS, 0);   // GREEN
+            break;
+    }
+
+    if (millis() - ledLastMs >= halfCycle) {
+        ledLastMs = millis();
+        ledState  = !ledState;
+        strip.setPixelColor(0, ledState ? colour : 0);
+        strip.show();
     }
 }
 
@@ -494,8 +529,9 @@ void setupOTA() {
         Serial.println("[OTA] Starting…");
         NimBLEDevice::stopAdvertising();
         if (adcSinceFlush > 0) adcFlushNVS();
-        ledLastToggle = 0; ledState = true;
-        digitalWrite(LED_PIN, HIGH);
+        // Solid white during OTA
+        strip.setPixelColor(0, strip.Color(LED_BRIGHTNESS, LED_BRIGHTNESS, LED_BRIGHTNESS));
+        strip.show();
     });
     ArduinoOTA.onEnd([]()  { Serial.println("\n[OTA] Done"); });
     ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
@@ -527,9 +563,11 @@ void setup() {
     delay(3000);
     Serial.println("\n===== ESP32-C6 BLE Message Server + ADC Logger =====");
 
-    // LED
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+    // NeoPixel LED init
+    strip.begin();
+    strip.setBrightness(LED_BRIGHTNESS);
+    strip.clear();
+    strip.show();
 
     // ADC pin
     pinMode(ADC_PIN, INPUT);
@@ -551,6 +589,7 @@ void setup() {
         messagePresent ? "READY" : "EMPTY");
     Serial.printf("[ADC] Restored %u samples from NVS (head=%u)\n",
         adcCount, adcHead);
+    updateLedMode();
 
     // Network stack
     setupWiFi();
